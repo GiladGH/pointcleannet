@@ -10,6 +10,7 @@ import torch.nn.parallel
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data
+import matplotlib.pyplot as plt
 from torch.autograd import Variable
 from tensorboardX import SummaryWriter
 from dataset import PointcloudPatchDataset, RandomPointcloudPatchSampler, SequentialShapeRandomPointcloudPatchSampler
@@ -21,7 +22,7 @@ def parse_arguments():
 
     # naming / file handling
     parser.add_argument(
-        '--name', type=str, default='PoinCleanNet', help='training run name')
+        '--name', type=str, default='PointCleanNet', help='training run name')
     parser.add_argument(
         '--desc', type=str, default='My training run for PointCleanNet noise removal', help='description')
     parser.add_argument('--indir', type=str, default='../data/pointCleanNetDataset',
@@ -35,15 +36,15 @@ def parse_arguments():
     parser.add_argument('--testset', type=str,
                         default='validationset.txt', help='test set file name')
     parser.add_argument('--saveinterval', type=int,
-                        default='10', help='save model each n epochs')
+                        default='5', help='save model each n epochs')
     parser.add_argument('--refine', type=str, default='',
                         help='refine model at this path')
 
     # training parameters
-    parser.add_argument('--nepoch', type=int, default=2000,
+    parser.add_argument('--nepoch', type=int, default=1000,
                         help='number of epochs to train for')
     parser.add_argument('--batchSize', type=int,
-                        default=64, help='input batch size')
+                        default=48, help='input batch size')
     parser.add_argument('--patch_radius', type=float, default=[
                         0.05], nargs='+', help='patch radius in multiples of the shape\'s bounding box diagonal, multiple values for multi-scale.')
     parser.add_argument('--patch_center', type=str, default='point', help='center patch at...\n'
@@ -51,7 +52,7 @@ def parse_arguments():
                         'mean: patch mean')
     parser.add_argument('--patch_point_count_std', type=float, default=0,
                         help='standard deviation of the number of points in a patch')
-    parser.add_argument('--patches_per_shape', type=int, default=400,# 800,
+    parser.add_argument('--patches_per_shape', type=int, default=500,# 800,
                         help='number of patches sampled from each shape in an epoch')
     parser.add_argument('--workers', type=int, default=1,
                         help='number of data loading workers - 0 means same thread as main execution')
@@ -73,15 +74,15 @@ def parse_arguments():
     # model hyperparameters
     parser.add_argument('--outputs', type=str, nargs='+', default=['clean_points'], help='output of the network')
     parser.add_argument('--use_point_stn', type=int,
-                        default=True, help='use point spatial transformer')
+                        default=False, help='use point spatial transformer')
     parser.add_argument('--use_feat_stn', type=int,
-                        default=True, help='use feature spatial transformer')
+                        default=False, help='use feature spatial transformer')
     parser.add_argument('--sym_op', type=str, default='max',
                         help='symmetry operation')
     parser.add_argument('--point_tuple', type=int, default=1,
                         help='use n-tuples of points as input instead of single points')
     parser.add_argument('--points_per_patch', type=int,
-                        default=500, help='max. number of points per patch')# 50
+                        default=50, help='max. number of points per patch')# 50
 
     return parser.parse_args()
 
@@ -194,7 +195,7 @@ def train_pcpnet(opt):
 
     if opt.seed < 0:
         opt.seed = random.randint(1, 10000)
-    print("Random Seed: %d" % (opt.seed))
+        print("Random Seed: %d" % (opt.seed))
     random.seed(opt.seed)
     torch.manual_seed(opt.seed)
     # create train and test dataset loaders
@@ -230,7 +231,12 @@ def train_pcpnet(opt):
     with open(desc_filename, 'w+') as text_file:
         print(opt.desc, file=text_file)
 
+    train_loss_vec = []
+    test_loss_vec = []
     for epoch in range(opt.nepoch):
+        epoch_train_loss = 0
+        epoch_test_loss = 0
+
         current_train_batch_index = -1
         train_completion = 0.0
         train_batches = enumerate(train_dataloader, 0)
@@ -245,11 +251,11 @@ def train_pcpnet(opt):
             pcpnet.train()
             # prepare noisy points batch
             points = data[0]
-            points = Variable(points).transpose(2, 1)
+            points = points.transpose(2, 1)
             points = points.cuda()
             # prepare ground truth points batch
             target = data[1:-1]
-            target = tuple(Variable(t) for t in target)
+            target = tuple(t for t in target)
             target = tuple(t.cuda() for t in target)
             # zero gradients
             optimizer.zero_grad()
@@ -270,11 +276,14 @@ def train_pcpnet(opt):
             train_completion = (current_train_batch_index + 1) / total_train_batches
 
             # print info and update log file
-            print('[%s %d/%d: %d/%d] %s loss: %f' % (opt.name, epoch, opt.nepoch, current_train_batch_index,
+            if current_train_batch_index % 500 == 0:
+                print('[%s %d/%d: %d/%d] %s loss: %f' % (opt.name, epoch, opt.nepoch, current_train_batch_index,
                                                   total_train_batches - 1, green('train'), loss.item()))
             # print('min normal len: %f' % (pred.data.norm(2,1).min()))
             train_writer.add_scalar('loss', loss.item(),
                                     (epoch + train_completion) * total_train_batches * opt.batchSize)
+
+            epoch_train_loss += loss.item()
 
             while test_completion <= train_completion and current_test_batch_index + 1 < total_test_batches:
 
@@ -286,32 +295,45 @@ def train_pcpnet(opt):
                 # volatile means that autograd is turned off for everything that depends on the volatile variable
                 # since we dont need autograd for inference (only for training)
                 points = data[0]
-                points = Variable(points, volatile=True)
                 points = points.transpose(2, 1)
                 points = points.cuda()
                 target = data[1:-1]
-                target = tuple(Variable(t, volatile=True) for t in target)
+                target = tuple(t for t in target)
                 target = tuple(t.cuda() for t in target)
 
                 # forward pass
-                pred, trans, _, _ = pcpnet(points)
-                loss = compute_loss(
-                    pred=pred, target=target,
-                    outputs=opt.outputs,
-                    output_pred_ind=output_pred_ind,
-                    output_target_ind=output_target_ind,
-                    patch_rot=trans if opt.use_point_stn else None)
+                with torch.no_grad():
+                    pred, trans, _, _ = pcpnet(points)
+                    loss = compute_loss(
+                        pred=pred, target=target,
+                        outputs=opt.outputs,
+                        output_pred_ind=output_pred_ind,
+                        output_target_ind=output_target_ind,
+                        patch_rot=trans if opt.use_point_stn else None)
 
-                test_completion = (current_test_batch_index + 1) / total_test_batches
+                    test_completion = (current_test_batch_index + 1) / total_test_batches
 
-                print('[%s %d: %d/%d] %s loss: %f' % (opt.name, epoch,
-                                                      current_train_batch_index, total_train_batches - 1, blue('test'), loss.item()))
-                test_writer.add_scalar(
-                    'loss', loss.item(), (epoch + test_completion) *total_train_batches * opt.batchSize)
+                    if current_train_batch_index % 500 == 0:
+                        print('[%s %d: %d/%d] %s loss: %f' % (opt.name, epoch,
+                                                             current_train_batch_index, total_train_batches - 1, blue('test'), loss.item()))
+                    test_writer.add_scalar(
+                        'loss', loss.item(), (epoch + test_completion) *total_train_batches * opt.batchSize)
+                epoch_test_loss += loss.item()
+
+        train_loss_vec.append(epoch_train_loss/total_train_batches)
+        test_loss_vec.append(epoch_test_loss/total_test_batches)
 
         # save model, overwriting the old model
         if epoch % opt.saveinterval == 0 or epoch == opt.nepoch - 1:
             torch.save(pcpnet.state_dict(), model_filename)
+
+            plt.figure()
+            plt.plot(range(epoch + 1), train_loss_vec, 'b')
+            plt.plot(range(epoch + 1), test_loss_vec, 'r')
+            plt.ylabel('Loss')
+            plt.xlabel('epochs')
+            plt.legend(['train loss', 'validation loss'])
+            plt.savefig('loss2.png')
 
         # save model in a separate file in epochs 0,5,10,50,100,500,1000, ...
         if epoch % (5 * 10**math.floor(math.log10(max(2, epoch - 1)))) == 0 or epoch % 100 == 0 or epoch == opt.nepoch - 1:
@@ -321,7 +343,7 @@ def train_pcpnet(opt):
 
 def compute_surface_dist(prediction, target):
     # compute dist from target  prediction
-    m2 =prediction.expand(target.shape[1],prediction.shape[0], 3).transpose(0, 1)
+    m2 = prediction.expand(target.shape[1], prediction.shape[0], 3).transpose(0, 1)
     m1 = target
     m = (m1 - m2).pow(2).sum(2)
     min_dist = torch.min(m, 1)[0]
@@ -345,7 +367,7 @@ def compute_loss(pred, target, outputs, output_pred_ind, output_target_ind,  pat
     loss = 0
     for output_index, output in enumerate(outputs):
         if output in ['clean_points']:
-            loss += compute_clean_point_loss(pred, output_pred_ind, output_index,  target, output_target_ind,patch_rot)
+            loss += compute_clean_point_loss(pred, output_pred_ind, output_index,  target, output_target_ind, patch_rot)
         else:
             raise ValueError('Unsupported output type: %s' % (output))
     return loss
